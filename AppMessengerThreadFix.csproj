@@ -41,10 +41,11 @@
     <Reference Include="SpaceCore">
       <HintPath>libs/SpaceCore.dll</HintPath>
       <Private>false</Private>
+    </Reference>
     <Reference Include="SmartphoneAppMessenger">
-  <HintPath>libs/Smartphone-AppMessenger.dll</HintPath>
-  <Private>false</Private>
-</Reference>
+      <HintPath>libs/Smartphone-AppMessenger.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
   <ItemGroup>
