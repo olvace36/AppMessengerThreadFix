@@ -170,6 +170,16 @@ namespace AppMessengerThreadFix
     {
         private static bool IsMainThread => Environment.CurrentManagedThreadId == ModEntry.MainThreadId;
 
+        // Logs EVERY call, even on the main thread, at Trace level — this is purely to verify
+        // the patches are actually being hit at all. If you never see these during a call,
+        // the patch isn't intercepting the real runtime calls and we need a different target.
+        private static void LogHit(string apiName)
+        {
+            ModEntry.SMonitor?.Log(
+                $"[DialogueGuard/HIT] '{apiName}' called on thread {Environment.CurrentManagedThreadId} (main={ModEntry.MainThreadId}).",
+                LogLevel.Trace);
+        }
+
         private static void LogOffThreadCall(string apiName)
         {
             string trace = new StackTrace(2, false).ToString();
@@ -180,6 +190,7 @@ namespace AppMessengerThreadFix
 
         internal static bool GuardPrepare(Dialogue __instance)
         {
+            LogHit("prepareCurrentDialogueForDisplay");
             if (IsMainThread) return true;
             LogOffThreadCall("prepareCurrentDialogueForDisplay");
             MainThreadDispatcher.RunAndWait(() => __instance.prepareCurrentDialogueForDisplay());
@@ -188,6 +199,7 @@ namespace AppMessengerThreadFix
 
         internal static bool GuardIsFinished(Dialogue __instance, ref bool __result)
         {
+            LogHit("isDialogueFinished");
             if (IsMainThread) return true;
             LogOffThreadCall("isDialogueFinished");
             __result = MainThreadDispatcher.RunAndWait(() => __instance.isDialogueFinished());
@@ -196,6 +208,7 @@ namespace AppMessengerThreadFix
 
         internal static bool GuardIsQuestion(Dialogue __instance, ref bool __result)
         {
+            LogHit("isCurrentDialogueAQuestion");
             if (IsMainThread) return true;
             LogOffThreadCall("isCurrentDialogueAQuestion");
             __result = MainThreadDispatcher.RunAndWait(() => __instance.isCurrentDialogueAQuestion());
@@ -204,6 +217,7 @@ namespace AppMessengerThreadFix
 
         internal static bool GuardGetCurrentDialogue(Dialogue __instance, ref string __result)
         {
+            LogHit("getCurrentDialogue");
             if (IsMainThread) return true;
             LogOffThreadCall("getCurrentDialogue");
             __result = MainThreadDispatcher.RunAndWait(() => __instance.getCurrentDialogue());
@@ -212,6 +226,7 @@ namespace AppMessengerThreadFix
 
         internal static bool GuardGetResponseOptions(Dialogue __instance, ref Response[] __result)
         {
+            LogHit("getResponseOptions");
             if (IsMainThread) return true;
             LogOffThreadCall("getResponseOptions");
             __result = MainThreadDispatcher.RunAndWait(() => __instance.getResponseOptions());
@@ -220,6 +235,7 @@ namespace AppMessengerThreadFix
 
         internal static bool GuardExitCurrentDialogue(Dialogue __instance)
         {
+            LogHit("exitCurrentDialogue");
             if (IsMainThread) return true;
             LogOffThreadCall("exitCurrentDialogue");
             MainThreadDispatcher.RunAndWait(() => __instance.exitCurrentDialogue());
@@ -228,6 +244,7 @@ namespace AppMessengerThreadFix
 
         internal static bool GuardChooseResponse(Dialogue __instance, Response response)
         {
+            LogHit("chooseResponse");
             if (IsMainThread) return true;
             LogOffThreadCall("chooseResponse");
             MainThreadDispatcher.RunAndWait(() => __instance.chooseResponse(response));
