@@ -99,11 +99,11 @@ namespace AppMessengerThreadFix
             return false;
         }
 
-        internal static bool GuardPlaySound(string cueName, int delay, GameLocation location)
+        internal static bool GuardPlaySound(string soundName, int delay, GameLocation location)
         {
             if (IsMainThread) return true;
             LogOffThreadCall(nameof(DelayedAction.playSoundAfterDelay));
-            ModEntry.MainThreadQueue.Enqueue(() => DelayedAction.playSoundAfterDelay(cueName, delay, location));
+            ModEntry.MainThreadQueue.Enqueue(() => DelayedAction.playSoundAfterDelay(soundName, delay, location));
             return false;
         }
     }
