@@ -1,0 +1,20 @@
+{
+  "Name": "AppMessenger Thread Fix",
+  "Author": "olvace36",
+  "Version": "1.0.0",
+  "Description": "Patches Smartphone App Messenger to avoid calling Game1/HUD APIs from background threads, which can crash the game on Android with no error log. Also logs diagnostic info if other cross-thread calls or unhandled exceptions occur.",
+  "UniqueID": "olvace36.AppMessengerThreadFix",
+  "EntryDll": "AppMessengerThreadFix.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": [],
+  "Dependencies": [
+    {
+      "UniqueID": "d5a1lamdtd.Smartphone-AppMessenger",
+      "IsRequired": true
+    },
+    {
+      "UniqueID": "Pathoschild.SMAPI.Harmony",
+      "IsRequired": false
+    }
+  ]
+}

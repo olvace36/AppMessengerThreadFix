@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <RootNamespace>AppMessengerThreadFix</RootNamespace>
+    <AssemblyName>AppMessengerThreadFix</AssemblyName>
+    <EnableHarmony>true</EnableHarmony>
+    <IgnoreModFilePatterns>\.pdb$</IgnoreModFilePatterns>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Pathoschild.Stardew.ModBuildConfig" Version="4.3.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Same pattern as SnsAndroidFix / LookupAnythingItemSources:
+      Android game assemblies (StardewValley.dll, StardewModdingAPI.dll, etc.) are expected
+      in the local libs/ folder for CI. This project additionally needs a reference to the
+      compiled SmartphoneAppMessenger.dll (and its dependency SmartphoneApi/Smartphone core dll
+      if MessageManager/HUDMessage types live there) so Harmony's AccessTools can resolve the
+      target methods at compile time.
+
+      Adjust the HintPath below to wherever you place the built AppMessenger dll in libs/.
+    -->
+    <Reference Include="SmartphoneAppMessenger">
+      <HintPath>libs/SmartphoneAppMessenger.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="manifest.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
