@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Threading;
 using HarmonyLib;
 using StardewModdingAPI;
 using StardewValley;
@@ -21,31 +22,47 @@ namespace AppMessengerThreadFix
 
             var harmony = new Harmony(this.ModManifest.UniqueID);
 
-            // 1) Known culprit: AddMessage is called from PhoneDialogueRuntime via Task.Run.
+            // Fire-and-forget game APIs: just queue, don't need the result back.
             harmony.Patch(
                 original: AccessTools.Method(typeof(MessageManager), nameof(MessageManager.AddMessage)),
                 prefix: new HarmonyMethod(typeof(CrossThreadGuard), nameof(CrossThreadGuard.GuardAddMessage))
             );
-
-            // 2) Guard the actual game APIs directly, to catch ANY caller (not just the
-            //    known one) that might invoke these off the main thread.
             harmony.Patch(
                 original: AccessTools.Method(typeof(Game1), nameof(Game1.addHUDMessage), new[] { typeof(HUDMessage) }),
                 prefix: new HarmonyMethod(typeof(CrossThreadGuard), nameof(CrossThreadGuard.GuardAddHudMessage))
             );
-
-            // NOTE: no explicit parameter-type array here. playSoundAfterDelay has extra
-            // trailing optional parameters (e.g. pitch) beyond what our prefix cares about,
-            // and there's only one overload with this name, so let Harmony resolve it instead
-            // of guessing the exact signature (a mismatch here throws "Null method" on Entry).
             harmony.Patch(
                 original: AccessTools.Method(typeof(DelayedAction), nameof(DelayedAction.playSoundAfterDelay)),
                 prefix: new HarmonyMethod(typeof(CrossThreadGuard), nameof(CrossThreadGuard.GuardPlaySound))
             );
 
-            // 3) Process-level safety net in case there's a managed exception we haven't
-            //    identified yet (won't catch true native crashes, but will catch anything
-            //    that is a .NET exception slipping past normal try/catch).
+            // The real race: PhoneDialogueRuntime reads/mutates the NPC's live Dialogue object
+            // on a background thread while Content Patcher can reload that same NPC's dialogue
+            // asset on the main thread. These calls need to BLOCK and run on the main thread,
+            // then return the real result back to the caller, or the delivery loop's logic breaks.
+            var dialogueType = typeof(Dialogue);
+
+            harmony.Patch(AccessTools.Method(dialogueType, "prepareCurrentDialogueForDisplay"),
+                prefix: new HarmonyMethod(typeof(DialogueGuard), nameof(DialogueGuard.GuardPrepare)));
+
+            harmony.Patch(AccessTools.Method(dialogueType, "isDialogueFinished"),
+                prefix: new HarmonyMethod(typeof(DialogueGuard), nameof(DialogueGuard.GuardIsFinished)));
+
+            harmony.Patch(AccessTools.Method(dialogueType, "isCurrentDialogueAQuestion"),
+                prefix: new HarmonyMethod(typeof(DialogueGuard), nameof(DialogueGuard.GuardIsQuestion)));
+
+            harmony.Patch(AccessTools.Method(dialogueType, "getCurrentDialogue"),
+                prefix: new HarmonyMethod(typeof(DialogueGuard), nameof(DialogueGuard.GuardGetCurrentDialogue)));
+
+            harmony.Patch(AccessTools.Method(dialogueType, "getResponseOptions"),
+                prefix: new HarmonyMethod(typeof(DialogueGuard), nameof(DialogueGuard.GuardGetResponseOptions)));
+
+            harmony.Patch(AccessTools.Method(dialogueType, "exitCurrentDialogue"),
+                prefix: new HarmonyMethod(typeof(DialogueGuard), nameof(DialogueGuard.GuardExitCurrentDialogue)));
+
+            harmony.Patch(AccessTools.Method(dialogueType, "chooseResponse"),
+                prefix: new HarmonyMethod(typeof(DialogueGuard), nameof(DialogueGuard.GuardChooseResponse)));
+
             AppDomain.CurrentDomain.UnhandledException += (s, e) =>
             {
                 this.Monitor.Log($"[FATAL/UnhandledException] IsTerminating={e.IsTerminating}\n{e.ExceptionObject}", LogLevel.Alert);
@@ -57,7 +74,7 @@ namespace AppMessengerThreadFix
             };
 
             helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
-            this.Monitor.Log("AppMessengerThreadFix: guards + diagnostics active.", LogLevel.Info);
+            this.Monitor.Log("AppMessengerThreadFix: guards + diagnostics active (Dialogue race guard enabled).", LogLevel.Info);
         }
 
         private void OnUpdateTicked(object? sender, StardewModdingAPI.Events.UpdateTickedEventArgs e)
@@ -70,13 +87,52 @@ namespace AppMessengerThreadFix
         }
     }
 
+    // Blocking dispatcher: background thread posts work to the main-thread queue and
+    // waits (with a timeout) for the real result, so callers get correct values back.
+    internal static class MainThreadDispatcher
+    {
+        private const int TimeoutMs = 3000;
+
+        public static T RunAndWait<T>(Func<T> func)
+        {
+            if (Environment.CurrentManagedThreadId == ModEntry.MainThreadId)
+                return func();
+
+            using var done = new ManualResetEventSlim(false);
+            T result = default!;
+            Exception? error = null;
+
+            ModEntry.MainThreadQueue.Enqueue(() =>
+            {
+                try { result = func(); }
+                catch (Exception ex) { error = ex; }
+                finally { done.Set(); }
+            });
+
+            if (!done.Wait(TimeoutMs))
+            {
+                ModEntry.SMonitor?.Log("[MainThreadDispatcher] Timed out waiting for main thread.", LogLevel.Error);
+                return default!;
+            }
+
+            if (error != null)
+                throw error;
+
+            return result;
+        }
+
+        public static void RunAndWait(Action action)
+        {
+            RunAndWait<object?>(() => { action(); return null; });
+        }
+    }
+
     internal static class CrossThreadGuard
     {
         private static bool IsMainThread => Environment.CurrentManagedThreadId == ModEntry.MainThreadId;
 
         private static void LogOffThreadCall(string apiName)
         {
-            // Skip frames for this helper + the guard method itself to show the real caller chain.
             string trace = new StackTrace(2, false).ToString();
             ModEntry.SMonitor?.Log(
                 $"[CrossThreadGuard] '{apiName}' called from thread {Environment.CurrentManagedThreadId} (main={ModEntry.MainThreadId}). Queuing to main thread.\nCaller trace:\n{trace}",
@@ -104,6 +160,77 @@ namespace AppMessengerThreadFix
             if (IsMainThread) return true;
             LogOffThreadCall(nameof(DelayedAction.playSoundAfterDelay));
             ModEntry.MainThreadQueue.Enqueue(() => DelayedAction.playSoundAfterDelay(soundName, delay, location));
+            return false;
+        }
+    }
+
+    // Guards for Dialogue methods PhoneDialogueRuntime touches from its background delivery loop.
+    // These block-and-wait (not fire-and-forget) because the loop needs the real return value.
+    internal static class DialogueGuard
+    {
+        private static bool IsMainThread => Environment.CurrentManagedThreadId == ModEntry.MainThreadId;
+
+        private static void LogOffThreadCall(string apiName)
+        {
+            string trace = new StackTrace(2, false).ToString();
+            ModEntry.SMonitor?.Log(
+                $"[DialogueGuard] '{apiName}' called from thread {Environment.CurrentManagedThreadId} (main={ModEntry.MainThreadId}). Redirecting to main thread.\nCaller trace:\n{trace}",
+                LogLevel.Warn);
+        }
+
+        internal static bool GuardPrepare(Dialogue __instance)
+        {
+            if (IsMainThread) return true;
+            LogOffThreadCall("prepareCurrentDialogueForDisplay");
+            MainThreadDispatcher.RunAndWait(() => __instance.prepareCurrentDialogueForDisplay());
+            return false;
+        }
+
+        internal static bool GuardIsFinished(Dialogue __instance, ref bool __result)
+        {
+            if (IsMainThread) return true;
+            LogOffThreadCall("isDialogueFinished");
+            __result = MainThreadDispatcher.RunAndWait(() => __instance.isDialogueFinished());
+            return false;
+        }
+
+        internal static bool GuardIsQuestion(Dialogue __instance, ref bool __result)
+        {
+            if (IsMainThread) return true;
+            LogOffThreadCall("isCurrentDialogueAQuestion");
+            __result = MainThreadDispatcher.RunAndWait(() => __instance.isCurrentDialogueAQuestion());
+            return false;
+        }
+
+        internal static bool GuardGetCurrentDialogue(Dialogue __instance, ref string __result)
+        {
+            if (IsMainThread) return true;
+            LogOffThreadCall("getCurrentDialogue");
+            __result = MainThreadDispatcher.RunAndWait(() => __instance.getCurrentDialogue());
+            return false;
+        }
+
+        internal static bool GuardGetResponseOptions(Dialogue __instance, ref Response[] __result)
+        {
+            if (IsMainThread) return true;
+            LogOffThreadCall("getResponseOptions");
+            __result = MainThreadDispatcher.RunAndWait(() => __instance.getResponseOptions());
+            return false;
+        }
+
+        internal static bool GuardExitCurrentDialogue(Dialogue __instance)
+        {
+            if (IsMainThread) return true;
+            LogOffThreadCall("exitCurrentDialogue");
+            MainThreadDispatcher.RunAndWait(() => __instance.exitCurrentDialogue());
+            return false;
+        }
+
+        internal static bool GuardChooseResponse(Dialogue __instance, Response response)
+        {
+            if (IsMainThread) return true;
+            LogOffThreadCall("chooseResponse");
+            MainThreadDispatcher.RunAndWait(() => __instance.chooseResponse(response));
             return false;
         }
     }
