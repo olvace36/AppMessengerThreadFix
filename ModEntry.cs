@@ -34,9 +34,12 @@ namespace AppMessengerThreadFix
                 prefix: new HarmonyMethod(typeof(CrossThreadGuard), nameof(CrossThreadGuard.GuardAddHudMessage))
             );
 
+            // NOTE: no explicit parameter-type array here. playSoundAfterDelay has extra
+            // trailing optional parameters (e.g. pitch) beyond what our prefix cares about,
+            // and there's only one overload with this name, so let Harmony resolve it instead
+            // of guessing the exact signature (a mismatch here throws "Null method" on Entry).
             harmony.Patch(
-                original: AccessTools.Method(typeof(DelayedAction), nameof(DelayedAction.playSoundAfterDelay),
-                    new[] { typeof(string), typeof(int), typeof(GameLocation) }),
+                original: AccessTools.Method(typeof(DelayedAction), nameof(DelayedAction.playSoundAfterDelay)),
                 prefix: new HarmonyMethod(typeof(CrossThreadGuard), nameof(CrossThreadGuard.GuardPlaySound))
             );
 
