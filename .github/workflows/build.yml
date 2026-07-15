@@ -1,1 +1,36 @@
-0
+name: Build AppMessengerThreadFix
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Build
+        run: dotnet build AppMessengerThreadFix.csproj --configuration Release
+
+      - name: Package mod
+        run: |
+          mkdir -p output/AppMessengerThreadFix
+          cp bin/Release/net9.0/AppMessengerThreadFix.dll output/AppMessengerThreadFix/
+          cp manifest.json output/AppMessengerThreadFix/
+          cd output && zip -r AppMessengerThreadFix.zip AppMessengerThreadFix/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppMessengerThreadFix
+          path: output/AppMessengerThreadFix.zip
