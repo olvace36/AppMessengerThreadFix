@@ -81,10 +81,26 @@ namespace AppMessengerThreadFix
                 this.Monitor.Log("Could not find PhoneDialogueRuntime.FirstDailyText to apply call cooldown.", LogLevel.Warn);
             }
 
-            // Track ANY mod's asset invalidation (Content Patcher's mass dialogue reload included),
-            // not just ones triggered by our own calls. This also protects the very first call of
-            // a session if it happens to land during one of these reload cycles that fires on its
-            // own regular schedule, unrelated to calling.
+            // IMPORTANT: we track AssetReady (fires when an asset actually finishes loading),
+            // NOT AssetsInvalidated (fires when CP merely announces an asset is stale). Content
+            // Patcher's invalidation announcements and its actual lazy reloads can be many
+            // seconds apart — a log showed the "invalidation requested" line at T, then the real
+            // ~150-NPC reload cascade (the expensive part) only actually happening at T+33s when
+            // something next touched dialogue. A cooldown keyed off the announcement was already
+            // "expired" by the time the heavy reload work happened, so it let a second call
+            // through right on top of it. Keying off AssetReady instead means the cooldown clock
+            // only starts once the actual (expensive) reload work is done.
+            helper.Events.Content.AssetReady += (s, e) =>
+            {
+                if (e.NameWithoutLocale.IsDirectlyUnderPath("Characters/Dialogue"))
+                {
+                    CallCooldownGuard.RecordInvalidation();
+                }
+            };
+
+            // Kept as a secondary signal too — harmless if it fires early, since RecordInvalidation
+            // just keeps pushing the cooldown window forward; the AssetReady handler above is the
+            // one that matters for timing accuracy.
             helper.Events.Content.AssetsInvalidated += (s, e) =>
             {
                 foreach (var name in e.NamesWithoutLocale)
@@ -316,17 +332,48 @@ namespace AppMessengerThreadFix
     // Blocks a new call from starting while a mass asset reload (Content Patcher's dialogue
     // reload included) may still be in progress — whether that reload was triggered by our
     // own last call, or happened on its own regular cycle unrelated to calling at all.
+    // Also force-runs GC shortly after a reload cascade goes quiet, to reclaim the memory
+    // Content Patcher just allocated instead of waiting for the runtime's own GC schedule.
     internal static class CallCooldownGuard
     {
         private const int CooldownMs = 25000; // 25 seconds after the last invalidation event
+        private const int GcDebounceMs = 1500; // run GC once reload activity has been quiet this long
         private static DateTime _lastInvalidationUtc = DateTime.MinValue;
         private static readonly object Lock = new();
+        private static Timer? _gcDebounceTimer;
 
         internal static void RecordInvalidation()
         {
             lock (Lock)
             {
                 _lastInvalidationUtc = DateTime.UtcNow;
+            }
+
+            // (Re)start the debounce timer every time a dialogue asset finishes reloading.
+            // As long as the cascade keeps streaming in (dozens of NPCs reloading within the
+            // same second), this keeps getting pushed back — the GC only actually runs once
+            // GcDebounceMs passes with no further reload activity, i.e. once the cascade is over.
+            _gcDebounceTimer?.Dispose();
+            _gcDebounceTimer = new Timer(RunPostCascadeGc, null, GcDebounceMs, Timeout.Infinite);
+        }
+
+        private static void RunPostCascadeGc(object? state)
+        {
+            try
+            {
+                long before = GC.GetTotalMemory(false);
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+                GC.WaitForPendingFinalizers();
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+                long after = GC.GetTotalMemory(false);
+
+                ModEntry.SMonitor?.Log(
+                    $"[CallCooldownGuard] Post-cascade GC: {before / 1024}KB -> {after / 1024}KB (freed {(before - after) / 1024}KB).",
+                    LogLevel.Debug);
+            }
+            catch (Exception ex)
+            {
+                ModEntry.SMonitor?.Log($"[CallCooldownGuard] Post-cascade GC failed: {ex.Message}", LogLevel.Warn);
             }
         }
 
@@ -392,12 +439,9 @@ namespace AppMessengerThreadFix
                 disposedCount += DisposeIconsFrom(appStoreManagerType, "AllMods");
                 disposedCount += DisposeIconsFrom(appStoreManagerType, "Mods");
 
-                if (disposedCount > 0)
-                {
-                    ModEntry.SMonitor?.Log(
-                        $"[AppStoreTextureFix] Disposed {disposedCount} cached textures.",
-                        LogLevel.Debug);
-                }
+                ModEntry.SMonitor?.Log(
+                    $"[AppStoreTextureFix] Disposed {disposedCount} cached textures.",
+                    LogLevel.Debug);
             }
             catch (Exception ex)
             {
@@ -430,3 +474,4 @@ namespace AppMessengerThreadFix
         }
     }
 }
+
