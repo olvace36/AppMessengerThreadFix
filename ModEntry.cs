@@ -1,8 +1,10 @@
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Threading;
 using HarmonyLib;
+using Microsoft.Xna.Framework.Graphics;
 using StardewModdingAPI;
 using StardewValley;
 using SmartphoneAppMessenger;
@@ -62,6 +64,65 @@ namespace AppMessengerThreadFix
 
             harmony.Patch(AccessTools.Method(dialogueType, "chooseResponse"),
                 prefix: new HarmonyMethod(typeof(DialogueGuard), nameof(DialogueGuard.GuardChooseResponse)));
+
+            // Cooldown guard: calling touches NPC friendship/dialogue data, which triggers a
+            // heavy Content Patcher reload of every NPC's dialogue across all content packs.
+            // If a second call starts while that reload is still running, it reads
+            // dialogue objects mid-replacement and crashes. Block new calls for a short
+            // window after the last one to let the reload finish first.
+            var runtimeType = AccessTools.TypeByName("SmartphoneAppMessenger.PhoneDialogueRuntime");
+            if (runtimeType != null)
+            {
+                harmony.Patch(AccessTools.Method(runtimeType, "FirstDailyText"),
+                    prefix: new HarmonyMethod(typeof(CallCooldownGuard), nameof(CallCooldownGuard.GuardFirstDailyText)));
+            }
+            else
+            {
+                this.Monitor.Log("Could not find PhoneDialogueRuntime.FirstDailyText to apply call cooldown.", LogLevel.Warn);
+            }
+
+            // Track ANY mod's asset invalidation (Content Patcher's mass dialogue reload included),
+            // not just ones triggered by our own calls. This also protects the very first call of
+            // a session if it happens to land during one of these reload cycles that fires on its
+            // own regular schedule, unrelated to calling.
+            helper.Events.Content.AssetsInvalidated += (s, e) =>
+            {
+                foreach (var name in e.NamesWithoutLocale)
+                {
+                    if (name.IsDirectlyUnderPath("Characters/Dialogue"))
+                    {
+                        CallCooldownGuard.RecordInvalidation();
+                        break;
+                    }
+                }
+            };
+
+            // AppStoreManager.DisposeTextures() (base Smartphone mod) is a no-op left in as a
+            // stub — description-image textures and per-mod icon textures are cached forever
+            // and never released. This accumulates native texture memory for the whole session
+            // and is a real contributor to the OOM aborts seen in crash logs (Mono's lock-free
+            // allocator failing to get a heap segment). Postfix the stub with real disposal.
+            // AppStoreManager is `internal`, so it's resolved by name via reflection rather
+            // than typeof() — no extra project reference needed.
+            var appStoreManagerType = AccessTools.TypeByName("Smartphone.AppStoreManager");
+            if (appStoreManagerType != null)
+            {
+                var disposeMethod = AccessTools.Method(appStoreManagerType, "DisposeTextures");
+                if (disposeMethod != null)
+                {
+                    harmony.Patch(disposeMethod,
+                        postfix: new HarmonyMethod(typeof(AppStoreTextureFix), nameof(AppStoreTextureFix.RealDispose)));
+                    this.Monitor.Log("AppStoreTextureFix: patched AppStoreManager.DisposeTextures.", LogLevel.Debug);
+                }
+                else
+                {
+                    this.Monitor.Log("AppStoreTextureFix: DisposeTextures method not found — skipping patch.", LogLevel.Warn);
+                }
+            }
+            else
+            {
+                this.Monitor.Log("AppStoreTextureFix: Smartphone.AppStoreManager type not found — skipping patch.", LogLevel.Warn);
+            }
 
             AppDomain.CurrentDomain.UnhandledException += (s, e) =>
             {
@@ -249,6 +310,123 @@ namespace AppMessengerThreadFix
             LogOffThreadCall("chooseResponse");
             MainThreadDispatcher.RunAndWait(() => __instance.chooseResponse(response));
             return false;
+        }
+    }
+
+    // Blocks a new call from starting while a mass asset reload (Content Patcher's dialogue
+    // reload included) may still be in progress — whether that reload was triggered by our
+    // own last call, or happened on its own regular cycle unrelated to calling at all.
+    internal static class CallCooldownGuard
+    {
+        private const int CooldownMs = 25000; // 25 seconds after the last invalidation event
+        private static DateTime _lastInvalidationUtc = DateTime.MinValue;
+        private static readonly object Lock = new();
+
+        internal static void RecordInvalidation()
+        {
+            lock (Lock)
+            {
+                _lastInvalidationUtc = DateTime.UtcNow;
+            }
+        }
+
+        internal static bool GuardFirstDailyText(string npcName, string message)
+        {
+            lock (Lock)
+            {
+                var now = DateTime.UtcNow;
+                var elapsed = (now - _lastInvalidationUtc).TotalMilliseconds;
+                if (_lastInvalidationUtc != DateTime.MinValue && elapsed < CooldownMs)
+                {
+                    ModEntry.SMonitor?.Log(
+                        $"[CallCooldownGuard] Blocked call to '{npcName}' — only {elapsed:F0}ms since the last asset reload event (cooldown {CooldownMs}ms). " +
+                        "This avoids reading NPC dialogue while it may still be mid-reload.",
+                        LogLevel.Warn);
+
+                    ModEntry.MainThreadQueue.Enqueue(() =>
+                        Game1.addHUDMessage(new HUDMessage("Please wait a moment before calling...", 3)));
+
+                    return false; // skip the original call entirely
+                }
+
+                return true; // allow the call, proceed as normal
+            }
+        }
+    }
+
+    // Real disposal logic for Smartphone.AppStoreManager.DisposeTextures(), which upstream
+    // was turned into a log-only stub ("disposal is disabled to preserve cache"). Every
+    // description-image texture fetched from the web and every per-mod icon texture stays
+    // alive in static collections for the rest of the session otherwise. Runs as a Harmony
+    // postfix, so the original stub still runs first (harmless) and this does the real work.
+    internal static class AppStoreTextureFix
+    {
+        internal static void RealDispose()
+        {
+            try
+            {
+                var appStoreManagerType = AccessTools.TypeByName("Smartphone.AppStoreManager");
+                if (appStoreManagerType == null)
+                    return;
+
+                int disposedCount = 0;
+
+                // 1) DescriptionImages: Dictionary<string, Texture2D>
+                var descProp = AccessTools.Property(appStoreManagerType, "DescriptionImages");
+                if (descProp?.GetValue(null) is IDictionary descDict)
+                {
+                    var keys = new object[descDict.Count];
+                    descDict.Keys.CopyTo(keys, 0);
+                    foreach (var key in keys)
+                    {
+                        if (descDict[key] is Texture2D tex && !tex.IsDisposed)
+                        {
+                            tex.Dispose();
+                            disposedCount++;
+                        }
+                    }
+                    descDict.Clear();
+                }
+
+                // 2) Per-mod icon textures (public AppStoreMod.IconTexture) on both list properties
+                disposedCount += DisposeIconsFrom(appStoreManagerType, "AllMods");
+                disposedCount += DisposeIconsFrom(appStoreManagerType, "Mods");
+
+                if (disposedCount > 0)
+                {
+                    ModEntry.SMonitor?.Log(
+                        $"[AppStoreTextureFix] Disposed {disposedCount} cached textures.",
+                        LogLevel.Debug);
+                }
+            }
+            catch (Exception ex)
+            {
+                ModEntry.SMonitor?.Log($"[AppStoreTextureFix] Error during real disposal: {ex.Message}", LogLevel.Warn);
+            }
+        }
+
+        private static int DisposeIconsFrom(Type appStoreManagerType, string propertyName)
+        {
+            int count = 0;
+
+            var listProp = AccessTools.Property(appStoreManagerType, propertyName);
+            if (listProp?.GetValue(null) is IEnumerable mods)
+            {
+                foreach (var mod in mods)
+                {
+                    if (mod == null) continue;
+
+                    var iconProp = AccessTools.Property(mod.GetType(), "IconTexture");
+                    if (iconProp?.GetValue(mod) is Texture2D tex && !tex.IsDisposed)
+                    {
+                        tex.Dispose();
+                        iconProp.SetValue(mod, null);
+                        count++;
+                    }
+                }
+            }
+
+            return count;
         }
     }
 }
